@@ -3,8 +3,6 @@ from telebot import types
 import requests
 import sqlite3
 import logging
-import time
-import threading
 from config import TELEGRAM_BOT_TOKEN, BOT_USERNAME, OSINT_API_KEY, PAYMENT_BOT_USERNAME, SUPPORT_BOT_USERNAME, VERIFICATION_CHANNEL, CHANNEL_ID, ADMIN_USER_ID
 
 # Set up logging
@@ -13,42 +11,73 @@ logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# Database setup
-conn = sqlite3.connect('users.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS users
-             (user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, credits INTEGER DEFAULT 4,
-              referrals INTEGER DEFAULT 0, status TEXT DEFAULT 'Guest', first_time INTEGER DEFAULT 1,
-              verified INTEGER DEFAULT 0)''')
-conn.commit()
+# Database setup with connection pooling
+def get_db_connection():
+    conn = sqlite3.connect('users.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    # Initialize or update schema
+    c = conn.cursor()
+    try:
+        c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, credits INTEGER, referrals INTEGER, status TEXT, first_time INTEGER, verified INTEGER, mirrors_created INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, number TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("PRAGMA table_info(users)")
+        columns = {row['name'] for row in c.fetchall()}
+        if 'mirrors_created' not in columns:
+            c.execute("ALTER TABLE users ADD COLUMN mirrors_created INTEGER DEFAULT 0")
+            conn.commit()
+            logger.info("Added 'mirrors_created' column to users table")
+    except sqlite3.Error as e:
+        logger.error(f"Database schema update error: {e}")
+    finally:
+        c.close()
+    return conn
 
 def get_user(user_id):
+    conn = get_db_connection()
     try:
-        c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         if row:
-            return dict(zip(['user_id', 'name', 'username', 'credits', 'referrals', 'status', 'first_time', 'verified'], row))
+            user_dict = dict(row)
+            # Ensure mirrors_created is present with default 0 if missing
+            if 'mirrors_created' not in user_dict:
+                user_dict['mirrors_created'] = 0
+            return user_dict
     except sqlite3.Error as e:
         logger.error(f"Database error in get_user: {e}")
+    finally:
+        c.close()
+        conn.close()
     return None
 
 def add_user(user_id, name, username):
+    conn = get_db_connection()
     try:
-        c.execute("INSERT OR IGNORE INTO users (user_id, name, username, credits, referrals, status, first_time, verified) VALUES (?, ?, ?, 4, 0, 'Guest', 1, 0)",
-                  (user_id, name, username))
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, name, username, credits, referrals, status, first_time, verified, mirrors_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (user_id, name, username, 4, 0, 'Guest', 1, 0, 0))
         conn.commit()
         logger.info(f"Added new user: {user_id}")
     except sqlite3.Error as e:
         logger.error(f"Database error in add_user: {e}")
+    finally:
+        c.close()
+        conn.close()
 
 def update_user(user_id, **kwargs):
+    conn = get_db_connection()
     try:
+        c = conn.cursor()
         for key, value in kwargs.items():
-            c.execute(f"UPDATE users SET {key}=? WHERE user_id=?", (value, user_id))
+            c.execute(f"UPDATE users SET {key} = ? WHERE user_id = ?", (value, user_id))
         conn.commit()
         logger.info(f"Updated user {user_id}: {kwargs}")
     except sqlite3.Error as e:
         logger.error(f"Database error in update_user: {e}")
+    finally:
+        c.close()
+        conn.close()
 
 def is_user_member(user_id):
     try:
@@ -75,6 +104,33 @@ def get_main_menu():
 def show_menu(chat_id):
     markup = get_main_menu()
     bot.send_message(chat_id, "💡 Choose an option:", reply_markup=markup)
+
+def is_number_searched(user_id, number):
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM history WHERE user_id = ? AND number = ?", (user_id, number))
+        count = c.fetchone()[0]
+        return count > 0
+    except sqlite3.Error as e:
+        logger.error(f"Database error in is_number_searched: {e}")
+        return False
+    finally:
+        c.close()
+        conn.close()
+
+def add_to_history(user_id, number):
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO history (user_id, number) VALUES (?, ?)", (user_id, number))
+        conn.commit()
+        logger.info(f"Added to history: user {user_id}, number {number}")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in add_to_history: {e}")
+    finally:
+        c.close()
+        conn.close()
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -147,9 +203,10 @@ def callback_handler(call):
     user_id = call.from_user.id
     user = get_user(user_id)
     
-    # Delete previous message when a button is clicked
+    # Delete previous message only if it's not a search result
     try:
-        bot.delete_message(chat_id, call.message.message_id)
+        if "SEARCH RESULTS AVAILABLE" not in call.message.text:
+            bot.delete_message(chat_id, call.message.message_id)
     except:
         pass  # Ignore if can't delete
     
@@ -163,8 +220,8 @@ def callback_handler(call):
     
     data = call.data
     if data == "osint":
-        bot.send_message(chat_id, "📱 Enter a 10-digit phone number to search:")
-        bot.register_next_step_handler(bot.send_message(chat_id, "📱 Enter a 10-digit phone number to search:"), process_phone_number)
+        bot.send_message(chat_id, "📱 Enter a 10-digit phone number to search:", reply_markup=types.ReplyKeyboardRemove())
+        bot.register_next_step_handler(call.message, process_phone_number)
     
     elif data == "profile":
         status_emoji = "👑 Premium" if user['status'] == 'Premium' else "👤 Guest"
@@ -278,18 +335,20 @@ def process_phone_number(message):
     
     if len(number) != 10 or not number.isdigit():
         bot.send_message(chat_id, "❌ Invalid! Use exactly 10 digits (e.g., 9876543210).")
-        bot.register_next_step_handler(bot.send_message(chat_id, "📱 Enter 10-digit number:"), process_phone_number)
+        bot.register_next_step_handler(message, process_phone_number)
         return
     
-    if user['credits'] < 2:
+    if user['credits'] < 2 and not is_number_searched(user_id, number):
         bot.send_message(chat_id, "❌ Low credits! Need 2 for search. Buy more via Purchase.")
         show_menu(chat_id)
         return
     
     searching_msg = bot.send_message(chat_id, "🔍 Searching... Please wait ⏳")
     
-    new_credits = user['credits'] - 2
-    update_user(user_id, credits=new_credits)
+    if not is_number_searched(user_id, number):
+        new_credits = user['credits'] - 2
+        update_user(user_id, credits=new_credits)
+        add_to_history(user_id, number)
     
     url = f"https://api.oblivionhunters.com/details?phone={number}&api_key={OSINT_API_KEY}"
     try:
@@ -329,14 +388,13 @@ def process_phone_number(message):
             output += "\n"
             
             alt = item.get('alt', None)
-            if alt and len(str(alt)) == 10 and str(alt).isdigit():
-                alt_output, error = perform_search(str(alt), user_id)
-                if error:
-                    output += f"🔄 Alt Search: {error}\n\n"
-                elif alt_output:
+            if alt and len(str(alt)) == 10 and str(alt).isdigit() and not is_number_searched(user_id, str(alt)):
+                alt_output, _ = perform_search(str(alt), user_id)
+                if alt_output:
                     output += alt_output + "\n\n"
+                    add_to_history(user_id, str(alt))  # Log alt number if searched
         
-        output += f"💳 Credits Remaining: {new_credits}\n"
+        output += f"💳 Credits Remaining: {user['credits'] - 2 if not is_number_searched(user_id, number) else user['credits']}\n"
         output += f"⏰ Searched on: {api_data.get('timestamp', 'N/A')}"
         
         msg = bot.send_message(chat_id, output, reply_markup=get_main_menu(), parse_mode='Markdown')
@@ -352,13 +410,7 @@ def process_phone_number(message):
         show_menu(chat_id)
 
 def perform_search(number, user_id):
-    user = get_user(user_id)
-    if not user or user['credits'] < 2:
-        return None, "❌ Insufficient credits for alt search."
-    
-    new_credits = user['credits'] - 2
-    update_user(user_id, credits=new_credits)
-    
+    # No credit deduction here, handled in process_phone_number
     url = f"https://api.oblivionhunters.com/details?phone={number}&api_key={OSINT_API_KEY}"
     try:
         response = requests.get(url, timeout=15)
@@ -389,7 +441,6 @@ def perform_search(number, user_id):
                 output += f"📧 Email: {item.get('email', 'N/A')}\n"
             output += "\n"
         
-        output += f"💳 Credits: {new_credits}\n"
         output += f"⏰ Alt searched on: {api_data.get('timestamp', 'N/A')}"
         
         return output, None
