@@ -3,6 +3,7 @@ from telebot import types
 import requests
 import sqlite3
 import logging
+import os
 from config import TELEGRAM_BOT_TOKEN, BOT_USERNAME, OSINT_API_KEY, PAYMENT_BOT_USERNAME, SUPPORT_BOT_USERNAME, VERIFICATION_CHANNEL, CHANNEL_ID, ADMIN_USER_ID
 
 # Set up logging
@@ -286,7 +287,7 @@ def callback_handler(call):
 
 @bot.message_handler(commands=['addcredits'])
 def add_credits(message):
-    if message.from_user.id != ADMIN_USER_ID:
+    if message.from_user.id != 7712183356:
         bot.reply_to(message, "🚫 Only the main admin can add credits!")
         return
     
