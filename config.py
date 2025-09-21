@@ -1,3 +1,5 @@
+import os
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 OSINT_API_KEY = os.getenv("OSINT_API_KEY")
